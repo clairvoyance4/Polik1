@@ -1,234 +1,271 @@
 """
 PolyMarket Research Bot
 -----------------------
-Uses Claude (claude-opus-4-6) with tool use to research PolyMarket markets,
-identify potentially interesting opportunities, and find where edge might exist.
+Uses Claude claude-opus-4-6 (adaptive thinking + tool use) to research PolyMarket
+prediction markets and cross-reference with external data sources to find edge.
+
+Data sources:
+  - PolyMarket Gamma API & CLOB (market prices, liquidity, order books)
+  - Google News RSS + BBC (no API key needed)
+  - CoinGecko (crypto data, no API key needed)
+  - TheSportsDB (sports data, no API key needed)
+  - Open-Meteo (weather forecasts, no API key needed)
 
 Usage:
     python polymarket_bot.py
-    python polymarket_bot.py --query "US elections"
-    python polymarket_bot.py --top 20 --min-volume 10000
+    python polymarket_bot.py --query "bitcoin"
+    python polymarket_bot.py --query "Premier League" --top 30
+    python polymarket_bot.py --focus crypto
+    python polymarket_bot.py --focus sports --top 20
 """
 
 import argparse
 import json
 import os
 import sys
-import time
-from typing import Any
 
 import anthropic
-import requests
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.rule import Rule
-from rich.table import Table
+
+from sources import crypto, news, polymarket, sports, weather
 
 load_dotenv()
-
 console = Console()
 
-GAMMA_API = os.getenv("POLYMARKET_GAMMA_API", "https://gamma-api.polymarket.com")
-CLOB_API = os.getenv("POLYMARKET_CLOB_API", "https://clob.polymarket.com")
-
-HEADERS = {
-    "User-Agent": "PolyMarket-Research-Bot/1.0",
-    "Accept": "application/json",
-}
-
 # ---------------------------------------------------------------------------
-# PolyMarket API helpers
-# ---------------------------------------------------------------------------
-
-def _get(url: str, params: dict | None = None, timeout: int = 15) -> Any:
-    """GET request with error handling."""
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.HTTPError as e:
-        return {"error": f"HTTP {e.response.status_code}: {e.response.text[:200]}"}
-    except requests.exceptions.RequestException as e:
-        return {"error": str(e)}
-
-
-def api_get_active_markets(
-    limit: int = 20,
-    offset: int = 0,
-    order_by: str = "volume24hr",
-    ascending: bool = False,
-    tag: str | None = None,
-) -> dict:
-    """
-    Fetch active, non-closed markets from PolyMarket Gamma API.
-    order_by options: volume24hr, liquidity, startDate, endDate
-    """
-    params: dict = {
-        "active": "true",
-        "closed": "false",
-        "limit": limit,
-        "offset": offset,
-        "order": order_by,
-        "ascending": str(ascending).lower(),
-    }
-    if tag:
-        params["tag"] = tag
-
-    data = _get(f"{GAMMA_API}/markets", params=params)
-    if isinstance(data, list):
-        return {"markets": data, "count": len(data)}
-    return data
-
-
-def api_get_market_details(market_id: str) -> dict:
-    """Fetch full details of a single market by its Gamma market ID."""
-    return _get(f"{GAMMA_API}/markets/{market_id}")
-
-
-def api_search_markets(
-    query: str,
-    limit: int = 20,
-    active_only: bool = True,
-) -> dict:
-    """Search markets by keyword."""
-    params: dict = {
-        "q": query,
-        "limit": limit,
-    }
-    if active_only:
-        params["active"] = "true"
-        params["closed"] = "false"
-
-    data = _get(f"{GAMMA_API}/markets", params=params)
-    if isinstance(data, list):
-        return {"markets": data, "count": len(data)}
-    return data
-
-
-def api_get_market_orderbook(token_id: str) -> dict:
-    """
-    Fetch the current order book for a market token from the CLOB API.
-    token_id is the outcome token ID (found in market details under 'clobTokenIds').
-    Returns bids/asks to assess liquidity and spread.
-    """
-    data = _get(f"{CLOB_API}/book", params={"token_id": token_id})
-    if isinstance(data, dict) and "error" not in data:
-        bids = data.get("bids", [])[:5]
-        asks = data.get("asks", [])[:5]
-        best_bid = float(bids[0]["price"]) if bids else None
-        best_ask = float(asks[0]["price"]) if asks else None
-        spread = round(best_ask - best_bid, 4) if (best_bid and best_ask) else None
-        mid = round((best_bid + best_ask) / 2, 4) if (best_bid and best_ask) else None
-        return {
-            "token_id": token_id,
-            "best_bid": best_bid,
-            "best_ask": best_ask,
-            "spread": spread,
-            "mid_price": mid,
-            "top_bids": bids,
-            "top_asks": asks,
-        }
-    return data
-
-
-def api_get_markets_by_tag(tag: str, limit: int = 20) -> dict:
-    """Fetch markets filtered by a specific tag/category."""
-    return api_get_active_markets(limit=limit, tag=tag)
-
-
-# ---------------------------------------------------------------------------
-# Tool definitions for Claude
+# Tool definitions (schema exposed to Claude)
 # ---------------------------------------------------------------------------
 
 TOOLS: list[dict] = [
+    # ── PolyMarket ──────────────────────────────────────────────────────────
     {
-        "name": "get_active_markets",
+        "name": "pm_get_active_markets",
         "description": (
-            "Fetch active markets from PolyMarket sorted by a given criterion. "
-            "Use this to get an overview of the most liquid/active markets. "
-            "order_by options: 'volume24hr' (default), 'liquidity', 'startDate', 'endDate'. "
-            "Returns market list with prices, volume, liquidity, and end dates."
+            "Fetch active PolyMarket markets sorted by a criterion. "
+            "order_by: 'volume24hr' (default), 'liquidity', 'startDate', 'endDate'. "
+            "Returns market list with current prices, volume, liquidity, end dates."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "limit": {"type": "integer", "description": "Number of markets to fetch (1-50)", "default": 20},
-                "offset": {"type": "integer", "description": "Pagination offset", "default": 0},
-                "order_by": {
-                    "type": "string",
-                    "description": "Sort field: volume24hr, liquidity, startDate, endDate",
-                    "default": "volume24hr",
-                },
-                "ascending": {"type": "boolean", "description": "Sort ascending if true", "default": False},
-                "tag": {"type": "string", "description": "Optional category tag to filter by (e.g. 'Politics', 'Crypto', 'Sports')"},
+                "limit": {"type": "integer", "default": 20, "description": "Markets to fetch (1-50)"},
+                "offset": {"type": "integer", "default": 0},
+                "order_by": {"type": "string", "default": "volume24hr"},
+                "ascending": {"type": "boolean", "default": False},
+                "tag": {"type": "string", "description": "Category filter: Politics, Crypto, Sports, Finance, Science…"},
             },
-            "required": [],
         },
     },
     {
-        "name": "search_markets",
-        "description": (
-            "Search PolyMarket markets by keyword. Use this to find markets on a specific topic "
-            "(e.g., 'bitcoin', 'trump', 'fed rate', 'super bowl'). Returns relevant active markets."
-        ),
+        "name": "pm_search_markets",
+        "description": "Search PolyMarket markets by keyword (e.g. 'bitcoin price', 'US election', 'Champions League').",
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search keyword or phrase"},
-                "limit": {"type": "integer", "description": "Max results to return", "default": 20},
-                "active_only": {"type": "boolean", "description": "Only return active/open markets", "default": True},
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+                "active_only": {"type": "boolean", "default": True},
             },
             "required": ["query"],
         },
     },
     {
-        "name": "get_market_details",
+        "name": "pm_get_market_details",
         "description": (
-            "Get full details for a specific market by its ID. "
-            "Returns complete market info including description, outcomes, current prices, "
-            "total volume, liquidity, start/end dates, and CLOB token IDs for orderbook lookup."
+            "Full details for a PolyMarket market: description, outcomes, current prices, "
+            "total volume, liquidity, resolution criteria, and clobTokenIds for order book lookup."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "market_id": {"type": "string", "description": "The PolyMarket market ID (slug or numeric ID)"},
-            },
+            "properties": {"market_id": {"type": "string", "description": "Market slug or numeric ID"}},
             "required": ["market_id"],
         },
     },
     {
-        "name": "get_market_orderbook",
+        "name": "pm_get_orderbook",
         "description": (
-            "Get the live order book for a specific outcome token. "
-            "Returns best bid/ask prices, spread, and top 5 levels on each side. "
-            "Use this to assess liquidity depth and identify wide spreads (potential inefficiency). "
-            "Get the token_id from get_market_details (field: clobTokenIds)."
+            "Live order book for an outcome token: best bid/ask, spread, mid price, top 5 levels. "
+            "Wide spread = thin liquidity = potential inefficiency. "
+            "token_id comes from pm_get_market_details (field: clobTokenIds)."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "token_id": {"type": "string", "description": "The CLOB outcome token ID"},
-            },
+            "properties": {"token_id": {"type": "string"}},
             "required": ["token_id"],
         },
     },
     {
-        "name": "get_markets_by_tag",
+        "name": "pm_get_markets_by_tag",
+        "description": "Browse markets by category tag: Politics, Crypto, Sports, Finance, Science, Entertainment, World.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tag": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["tag"],
+        },
+    },
+
+    # ── News ────────────────────────────────────────────────────────────────
+    {
+        "name": "news_search",
         "description": (
-            "Fetch markets filtered by category tag. "
-            "Common tags: 'Politics', 'Crypto', 'Sports', 'Finance', 'Science', 'Entertainment', 'World'. "
-            "Use this to explore a specific sector."
+            "Search recent news articles on any topic via Google News RSS (no API key). "
+            "Use this to check for recent developments that might affect a market's probability. "
+            "Example queries: 'Fed interest rate decision', 'bitcoin ETF', 'Premier League standings'."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "tag": {"type": "string", "description": "Category tag name"},
-                "limit": {"type": "integer", "description": "Max markets to return", "default": 20},
+                "query": {"type": "string", "description": "Search query (supports AND, OR, quotes)"},
+                "max_items": {"type": "integer", "default": 10, "description": "Max articles to return"},
             },
-            "required": ["tag"],
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "news_get_headlines",
+        "description": "Latest headlines from BBC News for a broad topic: world, business, tech, sport, science.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "default": "world", "description": "world | business | tech | sport | science"},
+                "max_items": {"type": "integer", "default": 10},
+            },
+        },
+    },
+
+    # ── Crypto ──────────────────────────────────────────────────────────────
+    {
+        "name": "crypto_get_coin_data",
+        "description": (
+            "Current market data for a cryptocurrency via CoinGecko (no API key). "
+            "Returns price, 24h/7d/30d % change, market cap, volume, ATH distance. "
+            "coin_id examples: bitcoin, ethereum, solana, chainlink, dogecoin, matic-network"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "coin_id": {"type": "string", "description": "CoinGecko coin ID (lowercase, hyphens)"},
+            },
+            "required": ["coin_id"],
+        },
+    },
+    {
+        "name": "crypto_get_price_history",
+        "description": "Daily price history for a coin over N days. Useful for trend analysis and context.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "coin_id": {"type": "string"},
+                "days": {"type": "integer", "default": 30, "description": "1-365"},
+            },
+            "required": ["coin_id"],
+        },
+    },
+    {
+        "name": "crypto_search_coin",
+        "description": "Find the CoinGecko coin ID for a ticker or name. Use before get_coin_data if unsure of ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Coin name or ticker, e.g. 'BTC', 'sol'"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "crypto_global_market",
+        "description": "Global crypto market overview: total market cap, BTC dominance, 24h volume, market cap change.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+
+    # ── Sports ──────────────────────────────────────────────────────────────
+    {
+        "name": "sports_search_team",
+        "description": (
+            "Search for a sports team by name via TheSportsDB (free, no key). "
+            "Returns team ID, league, country, and sport. "
+            "Use team ID for get_team_results and get_team_fixtures."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"team_name": {"type": "string", "description": "E.g. 'Arsenal', 'Lakers', 'Barcelona'"}},
+            "required": ["team_name"],
+        },
+    },
+    {
+        "name": "sports_get_team_results",
+        "description": "Last 5 match results for a team (by TheSportsDB team ID). Shows form, scores, opponents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"team_id": {"type": "string", "description": "TheSportsDB team ID"}},
+            "required": ["team_id"],
+        },
+    },
+    {
+        "name": "sports_get_team_fixtures",
+        "description": "Next 5 upcoming fixtures for a team (by TheSportsDB team ID). Shows dates and opponents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"team_id": {"type": "string", "description": "TheSportsDB team ID"}},
+            "required": ["team_id"],
+        },
+    },
+    {
+        "name": "sports_get_league_table",
+        "description": (
+            "Current league standings. "
+            "Common IDs: 4328=EPL, 4335=La Liga, 4331=Bundesliga, 4332=Serie A, 4334=Ligue 1, "
+            "4480=NBA, 4424=NFL. season format: '2023-2024' or '2024'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "league_id": {"type": "string"},
+                "season": {"type": "string", "description": "Optional season, e.g. '2023-2024'"},
+            },
+            "required": ["league_id"],
+        },
+    },
+    {
+        "name": "sports_search_event",
+        "description": "Search for a sporting event by name. E.g. 'Champions League Final', 'Super Bowl 2024'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"event_name": {"type": "string"}},
+            "required": ["event_name"],
+        },
+    },
+
+    # ── Weather ─────────────────────────────────────────────────────────────
+    {
+        "name": "weather_get_forecast",
+        "description": (
+            "Weather forecast for a city (1-14 days) via Open-Meteo (free, no key). "
+            "Returns daily max/min temp (°C), precipitation, wind, and condition description. "
+            "Use for weather-related markets or events affected by weather."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "City name, e.g. 'London', 'New York', 'Tokyo'"},
+                "days": {"type": "integer", "default": 7, "description": "Forecast days (1-14)"},
+            },
+            "required": ["city"],
+        },
+    },
+    {
+        "name": "weather_get_current",
+        "description": "Current weather conditions for a city: temperature, feels-like, precipitation, wind, humidity.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
         },
     },
 ]
@@ -237,24 +274,36 @@ TOOLS: list[dict] = [
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 
+_DISPATCH = {
+    "pm_get_active_markets":    lambda a: polymarket.get_active_markets(**a),
+    "pm_search_markets":        lambda a: polymarket.search_markets(**a),
+    "pm_get_market_details":    lambda a: polymarket.get_market_details(**a),
+    "pm_get_orderbook":         lambda a: polymarket.get_market_orderbook(**a),
+    "pm_get_markets_by_tag":    lambda a: polymarket.get_markets_by_tag(**a),
+    "news_search":              lambda a: news.search_news(**a),
+    "news_get_headlines":       lambda a: news.get_latest_news(**a),
+    "crypto_get_coin_data":     lambda a: crypto.get_coin_data(**a),
+    "crypto_get_price_history": lambda a: crypto.get_coin_price_history(**a),
+    "crypto_search_coin":       lambda a: crypto.search_coin_id(**a),
+    "crypto_global_market":     lambda a: crypto.get_global_crypto_market(),
+    "sports_search_team":       lambda a: sports.search_team(**a),
+    "sports_get_team_results":  lambda a: sports.get_team_last_results(**a),
+    "sports_get_team_fixtures": lambda a: sports.get_team_next_fixtures(**a),
+    "sports_get_league_table":  lambda a: sports.get_league_table(**a),
+    "sports_search_event":      lambda a: sports.search_event(**a),
+    "weather_get_forecast":     lambda a: weather.get_weather_forecast(**a),
+    "weather_get_current":      lambda a: weather.get_current_weather(**a),
+}
+
+
 def dispatch_tool(name: str, input_args: dict) -> str:
-    """Execute a tool call and return result as JSON string."""
+    fn = _DISPATCH.get(name)
+    if fn is None:
+        return json.dumps({"error": f"Unknown tool: {name}"})
     try:
-        if name == "get_active_markets":
-            result = api_get_active_markets(**input_args)
-        elif name == "search_markets":
-            result = api_search_markets(**input_args)
-        elif name == "get_market_details":
-            result = api_get_market_details(**input_args)
-        elif name == "get_market_orderbook":
-            result = api_get_market_orderbook(**input_args)
-        elif name == "get_markets_by_tag":
-            result = api_get_markets_by_tag(**input_args)
-        else:
-            result = {"error": f"Unknown tool: {name}"}
+        result = fn(input_args)
     except Exception as e:
         result = {"error": f"Tool execution error: {e}"}
-
     return json.dumps(result, ensure_ascii=False, default=str)
 
 
@@ -264,98 +313,125 @@ def dispatch_tool(name: str, input_args: dict) -> str:
 
 SYSTEM_PROMPT = """You are an expert prediction market analyst specializing in PolyMarket.
 
-Your goal is to research active markets and identify where a trader could find EDGE —
-situations where the market price (implied probability) appears mispriced relative to
-the true probability of the outcome.
+Your goal is to find EDGE — situations where the market price (implied probability) is
+meaningfully different from the true probability. You have access to both PolyMarket data
+AND external data sources (news, crypto prices, sports stats, weather forecasts) to
+cross-reference and validate your analysis.
 
-## Framework for finding edge
+## Sources available to you
+- **PolyMarket**: active markets, order books, market details
+- **News**: Google News search + BBC headlines (real-time, no key needed)
+- **Crypto**: CoinGecko prices, history, global market data
+- **Sports**: TheSportsDB team form, fixtures, league tables
+- **Weather**: Open-Meteo forecasts for any city
 
-1. **Mispriced probability**: Market price significantly differs from what the evidence suggests.
-   - Example: A market at 15% for something that looks more like 35-40% based on base rates.
+## Edge detection framework
 
-2. **Information asymmetry**: You have access to better information or analysis than the
-   typical market participant.
+1. **Price vs reality mismatch** — Compare market price against external data:
+   - Crypto market at 70% BTC hits $100k → check actual BTC price/trend
+   - Sports market → check team form, head-to-head, league table
+   - Weather event → check actual forecast
+   - Political event → check recent polling/news
 
-3. **Liquidity inefficiency**: Wide bid-ask spreads, thin order books — the market hasn't
-   attracted enough capital to be efficient. This can mean easier entry/exit AND mispricing.
+2. **Information lag** — News broke recently but market hasn't repriced yet.
+   Always search for recent news on the market topic.
 
-4. **Recency bias / narrative-driven pricing**: Markets often over-react to recent news
-   or compelling narratives, creating temporary mispricings.
+3. **Liquidity inefficiency** — Check order books. Wide spread + thin book =
+   market hasn't attracted sophisticated capital = potential mispricing.
 
-5. **Base rate neglect**: Market prices often ignore base rates (historical frequency of
-   similar events).
+4. **Base rate neglect** — Market ignores historical base rates.
+   Example: "Will X happen in 30 days?" — how often does this typically happen?
 
-6. **Correlation opportunities**: Related markets priced inconsistently with each other.
+5. **Recency bias** — Market overweights recent dramatic events.
 
-## Research process
+6. **Correlated markets inconsistency** — Two related markets priced inconsistently.
 
-1. Start by surveying the landscape — get top markets by volume and liquidity.
-2. Also explore specific categories (Crypto, Politics, Finance, Sports) to find
-   less-trafficked opportunities.
-3. For promising markets, dig deeper: get full details, check the order book.
-4. Look for markets where you can articulate WHY the price might be wrong.
-5. Assess risk: how binary is the outcome? What's the resolution mechanism? When does it close?
+## Research workflow
+
+1. Survey landscape: get top markets by volume, then browse key categories
+2. For each interesting market: search for recent news, pull relevant external data
+3. Check order books on the most interesting markets
+4. Cross-reference: does external data support or contradict the market price?
+5. Look for multiple opportunities to confirm a thesis
 
 ## Output format
 
-After your research, produce a structured report with:
-- **Executive Summary**: 2-3 key findings
-- **Top Opportunities**: 3-5 specific markets with edge thesis, current price, your estimate, and edge rationale
-- **Markets to Watch**: 3-5 markets that are interesting but need more information
-- **Market Landscape**: Brief overview of what you observed across categories
-- **Methodology Notes**: Any limitations or caveats
+Produce a structured research report with:
 
-Be specific and quantitative where possible. Back every claim with data from the tools.
+### Executive Summary
+2-3 key findings in one sentence each.
+
+### Top Opportunities (3-5)
+For each:
+- **Market**: [name + current price]
+- **My estimate**: [probability I'd assign]
+- **Edge**: [why price is wrong — backed by data]
+- **Position**: [Yes/No, rough size tier: small/medium/large]
+- **Risk**: [what could go wrong]
+
+### Markets to Watch (3-5)
+Interesting but need more info or upcoming catalysts.
+
+### Market Landscape
+Brief sector overview: what's hot, what's illiquid, any patterns.
+
+### Data Notes
+Any API errors, limitations, or caveats about your research.
+
+Be specific and quantitative. Cite actual numbers from the tool outputs.
+Don't hedge everything — make clear calls where the data supports it.
 """
 
 
 # ---------------------------------------------------------------------------
-# Main bot logic
+# Main bot
 # ---------------------------------------------------------------------------
 
-def build_initial_prompt(query: str | None, top_n: int, min_volume: float) -> str:
-    parts = [
-        f"Please research PolyMarket and find the most interesting opportunities for finding edge.",
-        f"Focus on the top {top_n} most active/liquid markets, but also explore multiple categories.",
-    ]
+def build_prompt(query: str | None, top_n: int, focus: str | None) -> str:
+    parts = [f"Research PolyMarket and identify the best opportunities for finding edge."]
+    parts.append(f"Start by surveying the top {top_n} most active markets.")
+    if focus:
+        parts.append(f"Give extra attention to the '{focus}' category.")
     if query:
-        parts.append(f"Pay special attention to markets related to: '{query}'.")
-    if min_volume > 0:
-        parts.append(f"Filter for markets with at least ${min_volume:,.0f} in 24h volume where relevant.")
+        parts.append(f"Specifically investigate markets related to: '{query}'.")
     parts.append(
-        "Use the available tools iteratively to gather data. "
-        "Check order books for specific markets that look interesting. "
-        "Then produce your full research report."
+        "For each promising market, use external data sources (news, crypto, sports, weather) "
+        "to cross-reference the market price against reality. "
+        "Check order books on the most interesting markets. "
+        "Produce a full research report at the end."
     )
     return " ".join(parts)
 
 
-def run_research_bot(
+def run_bot(
     query: str | None = None,
     top_n: int = 20,
-    min_volume: float = 0,
-    max_tool_calls: int = 25,
+    focus: str | None = None,
+    max_tool_calls: int = 30,
 ) -> None:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        console.print("[red bold]Error:[/] ANTHROPIC_API_KEY not set. Copy .env.example to .env and add your key.")
+        console.print("[red bold]Error:[/] ANTHROPIC_API_KEY not set. Copy .env.example → .env and add your key.")
         sys.exit(1)
 
     client = anthropic.Anthropic(api_key=api_key)
 
+    # Header
     console.print(Panel.fit(
         "[bold cyan]PolyMarket Research Bot[/]\n"
-        "[dim]Powered by Claude claude-opus-4-6 with adaptive thinking[/]",
+        "[dim]Claude claude-opus-4-6 · adaptive thinking · "
+        "PolyMarket + News + Crypto + Sports + Weather[/]",
         border_style="cyan",
     ))
     console.print()
 
-    initial_prompt = build_initial_prompt(query, top_n, min_volume)
-    console.print(f"[dim]Research query:[/] {initial_prompt}")
+    prompt = build_prompt(query, top_n, focus)
+    console.print(f"[dim]Prompt:[/] {prompt}")
     console.print()
 
-    messages: list[dict] = [{"role": "user", "content": initial_prompt}]
+    messages: list[dict] = [{"role": "user", "content": prompt}]
     tool_call_count = 0
+    response = None
 
     with Progress(
         SpinnerColumn(),
@@ -363,10 +439,10 @@ def run_research_bot(
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task("Claude is thinking and researching...", total=None)
+        task = progress.add_task("Starting research...", total=None)
 
         while tool_call_count < max_tool_calls:
-            progress.update(task, description=f"Claude is working... ({tool_call_count} tool calls so far)")
+            progress.update(task, description=f"Claude thinking… ({tool_call_count} tool calls)")
 
             response = client.messages.create(
                 model="claude-opus-4-6",
@@ -377,46 +453,42 @@ def run_research_bot(
                 messages=messages,
             )
 
-            # Append assistant response
             messages.append({"role": "assistant", "content": response.content})
 
-            # Check stop reason
-            if response.stop_reason == "end_turn":
+            if response.stop_reason in ("end_turn", None):
                 break
-
             if response.stop_reason != "tool_use":
                 break
 
-            # Process tool calls
             tool_results = []
             for block in response.content:
                 if block.type != "tool_use":
                     continue
 
                 tool_call_count += 1
-                tool_name = block.name
-                tool_input = block.input
+                result_str = dispatch_tool(block.name, block.input)
 
-                progress.update(
-                    task,
-                    description=f"[cyan]Tool call {tool_call_count}:[/] {tool_name}({json.dumps(tool_input)[:60]}...)",
-                )
+                # Pretty-print tool call progress
+                try:
+                    preview = json.loads(result_str)
+                except Exception:
+                    preview = {}
 
-                result_str = dispatch_tool(tool_name, tool_input)
-
-                # Log tool call to console (below progress bar)
-                _preview = json.loads(result_str)
-                if isinstance(_preview, dict) and "markets" in _preview:
-                    count = _preview.get("count", len(_preview["markets"]))
-                    progress.console.print(
-                        f"  [dim]↳ {tool_name}[/] → [green]{count} markets returned[/]"
-                    )
-                elif isinstance(_preview, dict) and "error" in _preview:
-                    progress.console.print(
-                        f"  [dim]↳ {tool_name}[/] → [red]Error: {_preview['error'][:80]}[/]"
-                    )
+                if isinstance(preview, dict) and "error" in preview:
+                    status = f"[red]error: {str(preview['error'])[:60]}[/]"
+                elif isinstance(preview, dict) and "markets" in preview:
+                    status = f"[green]{preview.get('count', '?')} markets[/]"
+                elif isinstance(preview, dict) and "articles" in preview:
+                    status = f"[green]{preview.get('count', '?')} articles[/]"
+                elif isinstance(preview, dict) and "forecast" in preview:
+                    status = f"[green]{preview.get('city', '?')} forecast OK[/]"
                 else:
-                    progress.console.print(f"  [dim]↳ {tool_name}[/] → [green]OK[/]")
+                    status = "[green]OK[/]"
+
+                progress.console.print(
+                    f"  [dim]{tool_call_count:02d}.[/] [cyan]{block.name}[/]"
+                    f"({json.dumps(block.input)[:55]}…) → {status}"
+                )
 
                 tool_results.append({
                     "type": "tool_result",
@@ -426,82 +498,64 @@ def run_research_bot(
 
             messages.append({"role": "user", "content": tool_results})
 
-    # Extract final text response
+    # Output
     console.print()
     console.print(Rule("[bold cyan]Research Report[/]", style="cyan"))
     console.print()
 
-    final_text = ""
-    for block in response.content:
-        if hasattr(block, "type") and block.type == "text":
-            final_text = block.text
-            break
+    if response is None:
+        console.print("[red]No response from Claude.[/]")
+        return
+
+    final_text = next(
+        (block.text for block in response.content if hasattr(block, "type") and block.type == "text"),
+        None,
+    )
 
     if final_text:
         console.print(Markdown(final_text))
     else:
-        console.print("[yellow]No text output from Claude. Check API response.[/]")
+        console.print("[yellow]Claude returned no text. The model may have only used tools.[/]")
 
-    # Summary stats
+    # Stats footer
     console.print()
     console.print(Rule(style="dim"))
     console.print(
-        f"[dim]Tool calls made: {tool_call_count} | "
-        f"Messages in conversation: {len(messages)} | "
-        f"Input tokens: {response.usage.input_tokens} | "
-        f"Output tokens: {response.usage.output_tokens}[/]"
+        f"[dim]Tool calls: {tool_call_count} | "
+        f"Turns: {len(messages)} | "
+        f"In: {response.usage.input_tokens:,} tok | "
+        f"Out: {response.usage.output_tokens:,} tok[/]"
     )
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="PolyMarket Research Bot — find edge using Claude AI",
+        description="PolyMarket Research Bot — find edge with Claude + external data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python polymarket_bot.py
-  python polymarket_bot.py --query "bitcoin ETF"
-  python polymarket_bot.py --query "2024 elections" --top 30
-  python polymarket_bot.py --top 15 --min-volume 5000
+  python polymarket_bot.py --query "bitcoin"
+  python polymarket_bot.py --query "Premier League" --focus sports
+  python polymarket_bot.py --focus crypto --top 25
+  python polymarket_bot.py --query "US election" --top 30 --max-tools 40
         """,
     )
-    parser.add_argument(
-        "--query", "-q",
-        type=str,
-        default=None,
-        help="Focus research on markets matching this keyword/topic",
-    )
-    parser.add_argument(
-        "--top", "-n",
-        type=int,
-        default=20,
-        help="Number of top markets to survey (default: 20)",
-    )
-    parser.add_argument(
-        "--min-volume",
-        type=float,
-        default=0,
-        help="Minimum 24h volume filter in USD (default: 0)",
-    )
-    parser.add_argument(
-        "--max-tools",
-        type=int,
-        default=25,
-        help="Maximum number of tool calls (default: 25)",
-    )
+    parser.add_argument("--query", "-q", type=str, default=None,
+                        help="Topic to investigate (market keyword)")
+    parser.add_argument("--top", "-n", type=int, default=20,
+                        help="Top N markets to survey (default: 20)")
+    parser.add_argument("--focus", "-f", type=str, default=None,
+                        help="Category to focus on: crypto, sports, politics, finance, science")
+    parser.add_argument("--max-tools", type=int, default=30,
+                        help="Max tool calls allowed (default: 30)")
 
     args = parser.parse_args()
-
-    run_research_bot(
-        query=args.query,
-        top_n=args.top,
-        min_volume=args.min_volume,
-        max_tool_calls=args.max_tools,
-    )
+    run_bot(query=args.query, top_n=args.top, focus=args.focus, max_tool_calls=args.max_tools)
 
 
 if __name__ == "__main__":
