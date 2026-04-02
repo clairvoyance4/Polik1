@@ -1,96 +1,113 @@
 """
-News source — Google News RSS + BBC RSS (no API key required).
-
-Google News RSS is the primary source: it supports keyword search and
-returns fresh, relevant articles from thousands of publishers globally.
+News source — Google News RSS + BBC RSS.
+Uses only stdlib (xml.etree.ElementTree + requests) — no feedparser needed.
 """
 
 import html
 import re
-import time
+import xml.etree.ElementTree as ET
 from typing import Any
 
-import feedparser
 import requests
 
-# RSS feed definitions: (name, url_template)
-# For Google News: {query} is URL-encoded search term
 _GOOGLE_NEWS_SEARCH = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 
 _STATIC_FEEDS = {
-    "bbc_world": "http://feeds.bbci.co.uk/news/world/rss.xml",
-    "bbc_tech": "http://feeds.bbci.co.uk/news/technology/rss.xml",
+    "bbc_world":    "http://feeds.bbci.co.uk/news/world/rss.xml",
     "bbc_business": "http://feeds.bbci.co.uk/news/business/rss.xml",
-    "bbc_sport": "http://feeds.bbci.co.uk/news/sport/rss.xml",
-    "bbc_science": "http://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
+    "bbc_tech":     "http://feeds.bbci.co.uk/news/technology/rss.xml",
+    "bbc_sport":    "http://feeds.bbci.co.uk/news/sport/rss.xml",
+    "bbc_science":  "http://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
+}
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; PolyMarket-Research-Bot/1.0; "
+        "+https://github.com/clairvoyance4/polik1)"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
 
-def _clean_html(text: str) -> str:
-    text = re.sub(r"<[^>]+>", "", text)
+def _clean(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text or "")
     return html.unescape(text).strip()
 
 
-def _parse_entry(entry: Any) -> dict:
-    return {
-        "title": _clean_html(entry.get("title", "")),
-        "summary": _clean_html(entry.get("summary", ""))[:300],
-        "published": entry.get("published", ""),
-        "link": entry.get("link", ""),
-        "source": entry.get("source", {}).get("title", "") if isinstance(entry.get("source"), dict) else "",
-    }
+def _parse_rss(xml_bytes: bytes) -> list[dict]:
+    """Parse RSS XML and return list of article dicts."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return []
+
+    # Handle both RSS 2.0 and Atom namespaces
+    ns = {"media": "http://search.yahoo.com/mrss/"}
+    items = root.findall(".//item")
+    articles = []
+    for item in items:
+        def t(tag: str) -> str:
+            el = item.find(tag)
+            return _clean(el.text or "") if el is not None else ""
+
+        source_el = item.find("source")
+        source = _clean(source_el.text or "") if source_el is not None else ""
+
+        articles.append({
+            "title":     t("title"),
+            "summary":   t("description")[:300],
+            "published": t("pubDate"),
+            "link":      t("link"),
+            "source":    source,
+        })
+    return articles
+
+
+def _fetch_rss(url: str) -> tuple[list[dict], str | None]:
+    """Fetch and parse an RSS feed. Returns (articles, error_or_None)."""
+    try:
+        r = requests.get(url, headers=_HEADERS, timeout=15)
+        r.raise_for_status()
+        return _parse_rss(r.content), None
+    except requests.exceptions.RequestException as e:
+        return [], str(e)
 
 
 def search_news(query: str, max_items: int = 10) -> dict:
     """
-    Search recent news across the web via Google News RSS.
-    Returns titles, summaries, publication dates, and source names.
-    Useful for checking whether a market topic has recent developments.
+    Search recent news via Google News RSS (no API key).
+    Returns titles, summaries, dates, and source names.
     """
     url = _GOOGLE_NEWS_SEARCH.format(query=requests.utils.quote(query))
-    try:
-        feed = feedparser.parse(url)
-        if feed.bozo and not feed.entries:
-            return {"error": f"Failed to parse Google News RSS for '{query}'", "query": query}
-        items = [_parse_entry(e) for e in feed.entries[:max_items]]
-        return {
-            "query": query,
-            "source": "Google News",
-            "count": len(items),
-            "articles": items,
-        }
-    except Exception as e:
-        return {"error": str(e), "query": query}
+    articles, err = _fetch_rss(url)
+    if err and not articles:
+        return {"error": f"Google News RSS failed for '{query}': {err}", "query": query}
+    return {
+        "query": query,
+        "source": "Google News",
+        "count": len(articles[:max_items]),
+        "articles": articles[:max_items],
+    }
 
 
 def get_latest_news(topic: str = "world", max_items: int = 10) -> dict:
     """
-    Get latest headlines from BBC RSS for a broad topic.
-    topic options: world, business, tech, sport, science
+    Latest BBC headlines for a broad topic.
+    topic: world | business | finance | tech | technology | sport | sports | science
     """
     feed_map = {
-        "world": "bbc_world",
-        "business": "bbc_business",
-        "finance": "bbc_business",
-        "tech": "bbc_tech",
-        "technology": "bbc_tech",
-        "sport": "bbc_sport",
-        "sports": "bbc_sport",
-        "science": "bbc_science",
+        "world": "bbc_world", "business": "bbc_business",
+        "finance": "bbc_business", "tech": "bbc_tech",
+        "technology": "bbc_tech", "sport": "bbc_sport",
+        "sports": "bbc_sport", "science": "bbc_science",
     }
     feed_key = feed_map.get(topic.lower(), "bbc_world")
-    url = _STATIC_FEEDS[feed_key]
-
-    try:
-        feed = feedparser.parse(url)
-        if feed.bozo and not feed.entries:
-            return {"error": f"Failed to parse BBC RSS feed for topic '{topic}'"}
-        items = [_parse_entry(e) for e in feed.entries[:max_items]]
-        return {
-            "topic": topic,
-            "source": "BBC News",
-            "count": len(items),
-            "articles": items,
-        }
-    except Exception as e:
-        return {"error": str(e), "topic": topic}
+    articles, err = _fetch_rss(_STATIC_FEEDS[feed_key])
+    if err and not articles:
+        return {"error": f"BBC RSS failed for topic '{topic}': {err}"}
+    return {
+        "topic": topic,
+        "source": "BBC News",
+        "count": len(articles[:max_items]),
+        "articles": articles[:max_items],
+    }

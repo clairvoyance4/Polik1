@@ -32,7 +32,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.rule import Rule
 
-from sources import crypto, news, polymarket, sports, weather
+from sources import crypto, news, polymarket, sports, telegram, weather
 
 load_dotenv()
 console = Console()
@@ -403,24 +403,41 @@ def build_prompt(query: str | None, top_n: int, focus: str | None) -> str:
     return " ".join(parts)
 
 
+def _tg_credentials() -> tuple[str | None, str | None]:
+    """Return (token, chat_id) from env, or (None, None) if not configured."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    return token, chat_id
+
+
 def run_bot(
     query: str | None = None,
     top_n: int = 20,
     focus: str | None = None,
     max_tool_calls: int = 30,
+    send_telegram: bool = False,
 ) -> None:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         console.print("[red bold]Error:[/] ANTHROPIC_API_KEY not set. Copy .env.example → .env and add your key.")
         sys.exit(1)
 
+    tg_token, tg_chat_id = _tg_credentials()
+    if send_telegram and (not tg_token or not tg_chat_id):
+        console.print(
+            "[red bold]Error:[/] --telegram requires TELEGRAM_BOT_TOKEN and "
+            "TELEGRAM_CHAT_ID in your .env file."
+        )
+        sys.exit(1)
+
     client = anthropic.Anthropic(api_key=api_key)
 
     # Header
+    tg_badge = " · [green]→ Telegram[/]" if send_telegram else ""
     console.print(Panel.fit(
         "[bold cyan]PolyMarket Research Bot[/]\n"
         "[dim]Claude claude-opus-4-6 · adaptive thinking · "
-        "PolyMarket + News + Crypto + Sports + Weather[/]",
+        f"PolyMarket + News + Crypto + Sports + Weather{tg_badge}[/]",
         border_style="cyan",
     ))
     console.print()
@@ -527,6 +544,26 @@ def run_bot(
         f"Out: {response.usage.output_tokens:,} tok[/]"
     )
 
+    # ── Telegram ────────────────────────────────────────────────────────────
+    if send_telegram and final_text and tg_token and tg_chat_id:
+        import datetime
+        console.print()
+        console.print("[dim]Sending report to Telegram…[/]")
+
+        focus_tag = f" #{focus}" if focus else ""
+        query_tag = f" · {query}" if query else ""
+        header = (
+            f"📊 <b>PolyMarket Research Report</b>{query_tag}{focus_tag}\n"
+            f"🕐 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} UTC\n"
+            f"🔧 Tool calls: {tool_call_count}"
+        )
+
+        ok = telegram.send_report(tg_token, tg_chat_id, final_text, header=header)
+        if ok:
+            console.print("[green]✓ Report sent to Telegram.[/]")
+        else:
+            console.print("[red]✗ Telegram send failed. Check token/chat_id.[/]")
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -541,8 +578,9 @@ Examples:
   python polymarket_bot.py
   python polymarket_bot.py --query "bitcoin"
   python polymarket_bot.py --query "Premier League" --focus sports
-  python polymarket_bot.py --focus crypto --top 25
-  python polymarket_bot.py --query "US election" --top 30 --max-tools 40
+  python polymarket_bot.py --focus crypto --top 25 --telegram
+  python polymarket_bot.py --query "US election" --top 30 --max-tools 40 --telegram
+  python polymarket_bot.py --tg-test        # verify Telegram connection
         """,
     )
     parser.add_argument("--query", "-q", type=str, default=None,
@@ -553,9 +591,36 @@ Examples:
                         help="Category to focus on: crypto, sports, politics, finance, science")
     parser.add_argument("--max-tools", type=int, default=30,
                         help="Max tool calls allowed (default: 30)")
+    parser.add_argument("--telegram", "-t", action="store_true",
+                        help="Send research report to Telegram after completion")
+    parser.add_argument("--tg-test", action="store_true",
+                        help="Test Telegram connection and exit")
 
     args = parser.parse_args()
-    run_bot(query=args.query, top_n=args.top, focus=args.focus, max_tool_calls=args.max_tools)
+
+    if args.tg_test:
+        tg_token, tg_chat_id = _tg_credentials()
+        if not tg_token or not tg_chat_id:
+            console.print(
+                "[red bold]Error:[/] Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env first."
+            )
+            sys.exit(1)
+        console.print("[dim]Testing Telegram connection…[/]")
+        result = telegram.test_connection(tg_token, tg_chat_id)
+        if result["ok"]:
+            console.print(f"[green]✓ {result['message']}[/]")
+        else:
+            console.print(f"[red]✗ {result['message']}[/]")
+            sys.exit(1)
+        return
+
+    run_bot(
+        query=args.query,
+        top_n=args.top,
+        focus=args.focus,
+        max_tool_calls=args.max_tools,
+        send_telegram=args.telegram,
+    )
 
 
 if __name__ == "__main__":
